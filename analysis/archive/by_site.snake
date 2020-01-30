@@ -1,0 +1,349 @@
+# these are all old rules that have been superceded
+# keeping them anyway
+
+rule bwa_index:
+    input: '{name}.fa'
+    output: '{name}.fa.bwt'
+    threads: 16
+    shell:
+        'bwa index -p {threads} {input}'
+
+rule bwa_align:
+    input: '{name}.fa'
+    output: '{name}.fa.bam'
+    threads: 8
+    shell:
+        'bwa mem -t {threads} {input} {input} | samtools sort -O BAM -@ {threads} > {output}'
+
+rule subdivide_seqs:
+    input:
+        cdhit='{site}_cdhit_long.csv',
+        blast='{site}_merged_all.csv'
+    output: 
+        '{site}_{org}.fa'
+    shell:
+        'python subdivide_sequences.py {input.cdhit} {input.blast} {wildcards.site} {wildcards.org}'
+
+rule cat_site_fasta:
+    input:
+        B='Acer_Blackbird_Holobiont_01.fa',
+        C='Acer_Calabash_Holobiont_01.fa'
+    output: 'Holobiont_transcripts.fa'
+    shell: 'cat {input} > {output}'
+
+rule cat_site_org_fasta:
+    input:
+        B='Blackbird_{org}.fa',
+        C='Calabash_{org}.fa'
+    output: 'Allsite_{org}.fa'
+    shell: 'cat {input} > {output}'
+
+rule cdhit_org:
+    input: 'Allsite_{org}.fa'
+    output: 'Allsite_{org}_cdhit.fa.clstr'
+    params: 'Allsite_{org}_cdhit.fa'
+    threads: 28
+    log: 'Allsite_{org}_cdhit.log'
+    shell:
+        # -G use global sequence identity
+        # -c sequence identity threshold, default 0.9
+        # -aS alignment coverage for the shorter sequence, default 0.0
+        # -aL alignment coverage for the longer sequence, default 0.0
+        # -g  If set to 1, the program will cluster it into the most similar cluster that meet the threshold
+        # -M max available memory (Mbyte), default 400
+        # -d length of description in .clstr file, default 20
+        # -sc 1 - sort clusters by number of sequences
+        # -d 0 - write out full fasta header up to first space in cluster file
+        # -r 0 - only compare like strands
+        # -n 9 - word length
+        '''
+        cd-hit-est -i {input} -o {params} -G 0 -c 0.95 -aS 0.9 -aL 0.3 -T {threads} -g 1 -sc 1 -d 0 -M 0 -n 9 -r 0 > {log}
+        '''
+
+rule cdhit_to_fasta:
+    input:  
+        cluster = "{assembly}_cdhit.fasta.clstr",
+        fasta = "samples/Acer_{assembly}_Holobiont_01.fa"
+    output:  
+        csv = "{assembly}_cdhit_long.csv",
+        fa = "{assembly}_cdhit_long.fa"
+    run:
+        from itertools import groupby
+        import re
+
+        def fasta_iter(fasta_name):
+            fh = open(fasta_name)
+            faiter = (x[1] for x in groupby(fh, lambda line: line[0] == ">"))
+            for header in faiter:
+                headerStr = header.__next__()[1:].strip()
+                headerStr = headerStr.replace('.','_')
+                seq = "".join(s.strip() for s in faiter.__next__())
+                yield (headerStr, seq)
+
+        seqs = dict(fasta_iter(input.fasta))
+
+        cluster_regex = re.compile(r'(\d+).(\d+nt), >(.*)[.][.][.].*')
+        #cluster_max_regex = re.compile(r'(\d+).(\d+nt), >(.*)[.][.][.][\s][*].*')
+        clusters = defaultdict(list)
+        cluster_len = []
+        with open(input.cluster) as f :
+            cluster_name = None
+            for rec in f:
+                if rec.startswith('>') :
+                    clid = int(re.search('>Cluster ([0-9]+)',rec).group(1))
+                    cluster_name = 'cluster_{:06d}'.format(clid)
+                else:
+                    id, nt, seqid = cluster_regex.match(rec).groups()
+                    seqid = seqid.replace('.','_')
+                    seq = seqs[seqid]
+                    clusters[cluster_name].append((seqid,seq.strip()))
+                    cluster_len += [[cluster_name, seqid, seq.strip()]]
+
+        df = pd.DataFrame(cluster_len)
+        df.columns = ['cluster','seqid','seq']
+        df['len'] = df['seq'].str.len()
+
+        max_seq = df.loc[df.groupby(['cluster'])['len'].idxmax()]
+        max_seq.to_csv(output.csv, index=False)
+
+        with open(output.fa,'wt') as f :
+            for i in range(len(max_seq)):
+                w = max_seq.iloc[i]
+                f.write('>{}\n{}\n'.format(w['seqid'],w['seq']))
+
+rule diamond_taxon:
+    input: 'Holobiont_transcripts.fa'
+    output: 'Holobiont_transcripts_blast_taxon{org}.tab.gz'
+    params: taxonid=lambda w: taxonids[w.org]
+    threads: 28
+    shell:
+        '''
+        . /usr/local/Modules/default/init/bash
+        module load diamond
+        diamond blastx -v --compress 1 -f 6 qseqid sseqid stitle pident length qstart qend sstart send evalue staxids \
+        --range-culling --top 10 --query-cover 50 -F 15 \
+        -o {output[0]} --sensitive --query {input[0]} --db ../nr \
+        -p {threads} --taxonmap diamond_db/prot.accession2taxid.gz --taxonnodes diamond_db/nodes.dmp \
+        --taxonlist {params.taxonid}
+        '''
+
+
+rule merge_blast:
+    input: 
+        fa='Holobiont_transcripts.fa',
+        cdhit='Holobiont_cdhit.fa.clstr',
+        cni='Holobiont_transcripts_blast_taxoncni.tab.gz',
+        smb='Holobiont_transcripts_blast_taxonsmb.tab.gz'
+    output:
+        'Holobiont_transcripts_blast_annot.csv'
+    run:
+        from collections import defaultdict
+        import csv
+        import gzip
+        import pandas
+
+        transcripts = defaultdict(str)
+        with open(input.fa,'rt') as f :
+            curr_header = None
+            for i, line in enumerate(f) :
+                line = line.strip()
+                if line.startswith('>') :
+                    curr_header = line[1:]
+                else :
+                    transcripts[curr_header] += line
+        print('read transcriptome, {} sequences'.format(i))
+
+        def get_cluster_name(cluster) :
+            exemplar = [_ for _ in cluster if _.endswith('*')]
+            assert len(exemplar) in (0,1)
+            if len(exemplar) == 1 :
+                exemplar = exemplar[0]
+                return exemplar[exemplar.index('>')+1:exemplar.index('.')]
+
+        cluster_map = {}
+        with open(input.cdhit,'rt') as f :
+            curr_cluster = []
+            for i, line in enumerate(f) :
+                if line.startswith('>') :
+                    cluster_name = get_cluster_name(curr_cluster)
+                    for seq in curr_cluster :
+                        cluster_map[seq] = cluster_name
+                    curr_cluster = []
+                else :
+                    curr_cluster.append(line[line.index('>')+1:line.index('.')])
+            cluster_name = get_cluster_name(curr_cluster)
+            for seq in curr_cluster :
+                cluster_map[seq] = cluster_name
+        print('read cluster map')
+
+        annot = defaultdict(lambda: defaultdict(list))
+        columns=[
+            'SeqID','ClusterID','HoloID',
+            'Sbj_ID_cni','Sbj_title_cni','Sbj_start_cni','Sbj_end_cni',
+            'Sbj_ID_smb','Sbj_title_smb','Sbj_start_smb','Sbj_end_smb',
+            'seq'
+        ]
+
+        blast_cols = [
+            'qseqid', 'sseqid', 'stitle', 'pident', 'length',
+            'qstart', 'qend', 'sstart', 'send', 'evalue', 'staxid'
+        ]
+
+        def cast_fields(r) :
+            for f in ('length','qstart','qend','sstart','send') :
+                r[f] = int(r[f])
+            r['evalue'] = float(r['evalue'])
+            return r
+
+        i = 0
+        with gzip.open(input.cni,'rt') as f :
+            for r in csv.DictReader(f,blast_cols,delimiter='\t') :
+                annot[r['qseqid']]['cni'].append(cast_fields(r))
+                i += 1
+        #        if i == 1000 : break
+        print('processed Cni')
+
+        i = 0
+        with gzip.open(input.smb,'rt') as f :
+            for r in csv.DictReader(f,blast_cols,delimiter='\t') :
+                r['evalue'] = float(r['evalue'])
+                annot[r['qseqid']]['smb'].append(cast_fields(r))
+                i += 1
+        #        if i == 1000 : break
+        print('processed Smb')
+
+        def pick_best_hit(hits) :
+
+            min_evalue = min([_['evalue'] for _ in hits])
+            best_hits = [_ for _ in hits if _['evalue'] == min_evalue]
+
+            def filter_by_title_text(l,text) :
+                kept = [_ for _ in best_hits if text not in _['stitle']]
+                if len(kept) > 0 :
+                    return kept
+                return l
+
+            # prefer hits that don't have PREDICTED in the title
+            if len(best_hits) > 1 :
+                best_hits = filter_by_title_text(hits,'PREDICTED')
+
+            # prefer hits that don't have LOW QUALITY PROTEIN in the title
+            if len(best_hits) > 1 :
+                best_hits = filter_by_title_text(hits,'LOW QUALITY PROTEIN')
+
+            # prefer hits that don't have hypothetical protein in the title
+            if len(best_hits) > 1 :
+                best_hits = filter_by_title_text(hits,'hypothetical protein')
+
+            # otherwise just return first (i.e. random) hit
+            return best_hits[0]
+
+        with open(output[0],'wt') as out_f :
+            out_f = csv.DictWriter(out_f, columns, delimiter='\t')
+            out_f.writeheader()
+            for tid, seq in transcripts.items() :
+
+                tid_d = {
+                    'SeqID': tid,
+                    'ClusterID': cluster_map.get(tid,tid),
+                    'seq': seq
+                }
+
+                if tid in annot :
+
+                    org_hits = annot[tid]
+
+                    # if cni is in org_hits, there is a blast hit for Cnidaria
+                    if 'cni' in org_hits :
+                        min_hit = pick_best_hit(org_hits['cni'])
+                        tid_d.update({
+                            'Sbj_ID_cni': min_hit['sseqid'],
+                            'Sbj_title_cni': min_hit['stitle'],
+                            'Sbj_start_cni': min_hit['sstart'],
+                            'Sbj_end_cni': min_hit['send']
+                        })
+
+                    # if smb is in org_hits, there is a blast hit for Symbiodinimum
+                    if 'smb' in org_hits :
+                        min_hit = pick_best_hit(org_hits['smb'])
+                        tid_d.update({
+                            'Sbj_ID_smb': min_hit['sseqid'],
+                            'Sbj_title_smb': min_hit['stitle'],
+                            'Sbj_start_smb': min_hit['sstart'],
+                            'Sbj_end_smb': min_hit['send']
+                        })
+
+                    if 'Sbj_ID_cni' in tid_d and 'Sbj_ID_smb' in tid_d :
+                        tid_d['HoloID'] = '{}-{}'.format(
+                            tid_d['Sbj_ID_cni'],
+                            tid_d['Sbj_ID_smb']
+                        )
+                    elif 'Sbj_ID_cni' in tid_d :
+                        tid_d['HoloID'] = tid_d['Sbj_ID_cni']
+                    elif 'Sbj_ID_smb' in tid_d :
+                        tid_d['HoloID'] = tid_d['Sbj_ID_smb']
+
+                out_f.writerow(tid_d)
+
+                i += 1
+                #if i == 1000 : break
+
+
+rule subdivide_org:
+    input:
+        blast_annot='Holobiont_transcripts_blast_annot.csv'
+    output:
+        fa='Holobiont_transcripts_{org}.fa'
+    run:
+        import csv
+        import pandas
+        import sys
+
+        f = open(output.fa,'w')
+
+        org = wildcards.org
+
+        blast = pandas.read_csv(input.blast_annot,sep='\t',index_col=0)
+
+        if org == 'other' :
+
+            org_blast = blast[(blast['Sbj_ID_cni'] == '') & (blast['Sbj_ID_smb'] == '')]
+
+            for k,r in org_blast.iterrows() :
+                name = '{}'.format(k)
+                f.write('>{}\n{}\n'.format(name,r.seq))
+
+        else :
+
+            org_blast = blast[blast['Sbj_ID_'+org] != '']
+
+            g = open(output.fa.replace('.fa','.gtf'),'w')
+
+            g_out = csv.writer(g,delimiter='\t', quoting=csv.QUOTE_NONE,quotechar='')
+            for pid,df in org_blast.groupby('Sbj_ID_'+org) :
+                g_out.writerow([
+                    pid,'blast','gene',
+                    int(df['Sbj_start_'+org].min()),int(df['Sbj_end_'+org].max()),
+                    '.','.','.',
+                    'gene_id "{}"; gene_name "{}";'.format(
+                        pid, df.iloc[0]['Sbj_title_'+org]
+                    )
+                ])
+                for k,r in df.iterrows() :
+                    name = '{}|CNI={}|SYM={}'.format(k,r.Sbj_ID_cni,r.Sbj_ID_smb)
+                    site = k[5:7]
+                    f.write('>{}\n{}\n'.format(name,r.seq))
+                    g_out.writerow([
+                        pid,site,'transcript',
+                        int(r['Sbj_start_'+org]),int(r['Sbj_end_'+org]),
+                        '.','.','.',
+                        'gene_id "{}"; transcript_id "{}"; site "{}"; HoloID "{}"; Sbj_ID_cni "{}"; Sbj_ID_smb "{}";'.format(
+                            pid, name, site,
+                            r.HoloID, r.Sbj_ID_cni, r.Sbj_ID_smb
+                        )
+                    ])
+            g.close()
+
+        f.close()
+
+

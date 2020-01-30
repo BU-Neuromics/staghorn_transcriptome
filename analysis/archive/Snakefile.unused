@@ -1,0 +1,70 @@
+# this implementation is simple but prohibitively inefficient
+rule merge_blast_pandas:
+    input: 
+        fa='Holobiont_transcripts.fa',
+        cni='Holobiont_transcripts_blast_taxoncni.tab.gz',
+        smb='Holobiont_transcripts_blast_taxoncni.tab.gz'
+    output:
+        'Holobiont_transcripts_blast_annot.csvXXXX'
+    run:
+        from collections import defaultdict
+        import gzip
+        import pandas
+
+        transcripts = {}
+        with open(input.fa,'rt') as f :
+            for header in f :
+                seq = next(f)
+                transcripts[header[1:].strip()] = seq.strip()
+        print('read transcriptome')
+
+        #annot = defaultdict(dict)
+        annot = pandas.DataFrame(
+            index=transcripts.keys(),
+            columns=[
+                'HoloID',
+                'Sbj_ID_cni','Sbj_title_cni','Sbj_start_cni','Sbj_end_cni',
+                'Sbj_ID_smb','Sbj_title_smb','Sbj_start_smb','Sbj_end_smb',
+                'seq'
+            ]
+        )
+
+        blast_cols = [
+            'qseqid', 'sseqid', 'stitle', 'pident', 'length',
+            'qstart', 'qend', 'sstart', 'send', 'evalue'
+        ]
+        i = 0
+        with gzip.open(input.cni,'rt') as f :
+            blast = pandas.read_csv(f,sep='\t',names=blast_cols)
+            cols = ['Sbj_ID_cni','Sbj_title_cni','Sbj_start_cni','Sbj_end_cni']
+            for tid, df in blast.groupby('qseqid') :
+                min_eval = df.evalue.idxmin()
+                annot.loc[tid,cols] = df.loc[min_eval][['sseqid','stitle','sstart','send']]
+                annot.loc[tid,'seq'] = transcripts[tid]
+                i += 1
+                if i == 1000 : break
+        print('processed Cni')
+
+        i = 0
+        with gzip.open(input.smb,'rt') as f :
+            blast = pandas.read_csv(f,sep='\t',names=blast_cols)
+            cols = ['Sbj_ID_smb','Sbj_title_smb','Sbj_start_smb','Sbj_end_smb']
+            for tid, df in blast.groupby('qseqid') :
+                min_eval = df.evalue.idxmin()
+                annot.loc[tid,cols] = df.loc[min_eval][['sseqid','stitle','sstart','send']]
+                i += 1
+                if i == 1000 : break
+        print('processed Smb')
+
+        for tid, r in annot.iteritems() :
+            hid = []
+            if r.Sbj_ID_cni != '' :
+                hid.append(r.Sbj_ID_cni)
+            if r.Sbj_ID_smb != '' :
+                hid.append(r.Sbj_ID_smb)
+            annot.loc[tid,'HoloID'] = '-'.join(hid)
+        print('calculated HoloID')
+
+        annot[annot.HoloID != ''].to_csv(output[0],index=True,index_label='tid')
+
+
