@@ -25,11 +25,11 @@ taxclass_fa = expand('taxclass_fa/taxclass_{taxclass}_transcripts.fa.gz',
     taxclass=taxclasses
 )
 
-taxclass_counts = expand('taxclass_counts/{taxclass}_salmon_quant.csv',
+taxclass_counts = expand('all_salmon_quant__{taxclass}.csv',
     taxclass=taxclasses
 )
-filt_taxclass = [_.replace('.csv','__filt.csv') for _ in taxclass_counts]
-de_taxclass = expand('taxclass_counts/{taxclass}_de_site.csv',
+filt_taxclass = [_.replace('all_','filt_') for _ in taxclass_counts]
+de_taxclass = expand('{taxclass}_de_site.csv',
     taxclass=taxclasses
 )
 
@@ -555,64 +555,33 @@ rule sort_salmon:
         gtf='Holobiont_transcripts_all_blast.gtf'
     output:
         taxclass_counts
-    run:
-        import csv
-        import re
-
-        patt = re.compile('taxclass "([^"]*)"')
-
-        taxclass_map = {}
-        with open(input.gtf,'rt') as f :
-            for r in csv.reader(f,delimiter='\t') :
-                tid = r[0]
-                feature = r[2]
-                if feature == 'gene' :
-                    taxclass = patt.search(r[-1]).group(1)
-                    taxclass_map[tid] = taxclass
-
-        print(list(taxclass_map.items())[:10])
-
-        with open(input.cnts,'rt') as f :
-
-            f = csv.reader(f)
-            header = next(f)
-
-            # open all the file pointers
-            fps = {}
-            for tc in taxclasses :
-                fps[tc] = open('taxclass_counts/{}_salmon_quant.csv'.format(tc),'wt')
-                fps[tc].write(','.join(header)+'\n')
-
-            for r in f :
-                taxclass = taxclass_map[r[0]]
-                fps[taxclass].write(','.join(r)+'\n')
-
-        [_.close() for _ in fps.values()]
+    shell:
+        'python sort_salmon_by_taxclass.py {input.gtf} {input.cnts}'
 
 rule filter:
     input:
-        counts='taxclass_counts/{taxclass}_salmon_quant.csv',
+        counts='all_salmon_quant__{taxclass}.csv',
         info='sample_info.csv'
     output:
-        'taxclass_counts/{taxclass}_salmon_quant__filt.csv'
+        'filt_salmon_quant__{taxclass}.csv'
     shell:
         'detk-filter "zero(site) == 0" {input.counts} {input.info} -o {output}'
 
 rule de:
     input:
-        counts='taxclass_counts/{taxclass}_salmon_quant__filt.csv',
+        counts='filt_salmon_quant__{taxclass}.csv',
         info='sample_info.csv'
     output:
-        temp('taxclass_counts/{taxclass}_raw_de_site.csv')
+        temp('{taxclass}_raw_de_site.csv')
     shell:
         'detk-de deseq2 "counts ~ site[CC]" {input.counts} {input.info} -o {output}'
 
 rule de_annot:
     input:
-        de='taxclass_counts/{taxclass}_raw_de_site.csv',
+        de='{taxclass}_raw_de_site.csv',
         gtf='Holobiont_transcripts_all_blast.gtf'
     output:
-        'taxclass_counts/{taxclass}_de_site.csv'
+        '{taxclass}_de_site.csv'
     run:
         import csv
         import pandas
