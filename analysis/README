@@ -1,0 +1,42 @@
+The primary result files of this analysis are as follows:
+
+- *Holobiont_transcripts.fa*: concatenated assembled transcriptome sequences from
+  both sites in FASTA format
+- *Holobiont_cdhit.fa.clstr*: cdhit clusters of Holobiont_transcripts.fa
+- *Holobiont_transcripts_blast_annot.csv*: best hit blast annotations for each
+  sequence in Holobiont_transcripts.fa, fields:
+
+  * SeqID - `Acer__XX...` name of assembled transcript
+  * ClusterID - transcript name of the representative sequence that was
+    clustered with SeqID
+  * HoloID - ID composed of protein accessions of top blast hits from either or
+    both of CNI and SYM, if a single accession the sequence only mapped to one
+    organism, if in <CNI>-<SYM> format, the sequence blasted against Cnidaria
+    accession <CNI> and Symbiodinium accession <SYM>
+  * Sbj_ID_cni - accession of hit against Cnidaria
+  * Sbj_title_cni - protein name of hit against Cnidaria
+  * Sbj_start_cni - starting alignment position of sequence against accession
+  * Sbj_end_cni - starting alignment position of sequence against accession
+  * Sbj_ID_smb - accession of hit against Symbiodinium
+  * Sbj_title_smb - protein name of hit against Symbiodinium
+  * Sbj_start_smb - starting alignment position of sequence against accession
+  * Sbj_end_smb - starting alignment position of sequence against accession
+  * seq - the transcript sequence
+
+- *Holobiont_transcripts_other.fa*: transcripts that had blast hits for neither
+  Cnidaria nor Symbiodinium
+
+There is a set of files for each of Cnidaria and Symbiodinium, as follows:
+
+- *Holobiont_transcripts_cni.fa*: subset of Holobiont_transcripts.fa that blast
+  against something from Cnidaria
+- *Holobiont_transcripts_cni.gtf*: GTF annotation of Holobiont_transcripts.fa
+  that blast against something from Cnidaria
+- *all_salmon_quant_cni.csv*: salmon quantification of all eight FASTQ samples
+  against a salmon index built with the Cnidaria transcripts, consolidated to
+  the protein level
+- *filt_salmon_quant_cni.csv*: filtered counts, such that only proteins with
+  all non-zero counts in either site are included
+- *de_site_cni.csv*: deseq2 differential expression results comparing samples
+  from different sites (i.e. 4x4)
+
