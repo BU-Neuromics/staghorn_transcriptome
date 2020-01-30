@@ -1,0 +1,10 @@
+*.dmp
+*.gz
+*.fa
+*.gtf
+snakejob*
+*__salmon_quant
+*.fq
+*.swp
+.snakemake
+.ipynb_checkpoints
