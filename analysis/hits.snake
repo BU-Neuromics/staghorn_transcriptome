@@ -1,0 +1,134 @@
+subworkflow ref_index:
+    configfile: 'blank.conf'
+    snakefile: 'ref_index.snake'
+    workdir: 'hits'
+
+wildcard_constraints:
+    split="\d+",
+    db="(nt|nr)"
+
+nsplits = 20
+
+fa_splits = expand('hits/Holobiont_transcripts.{split:02d}.fa',split=range(nsplits))
+
+rule blast_all:
+    input:
+        'Holobiont_transcripts_blast_nr.tab.gz',
+        'Holobiont_transcripts_minimap_nt.tab.gz'
+
+rule split_fasta:
+    input: 'Holobiont_transcripts.fa'
+    output: fa_splits
+    shell:
+        '''
+        pyfasta split -n {nsplits} {input}
+        mv Holobiont_transcripts.*.fa hits/
+        '''
+
+rule diamond_nr_split:
+    input:
+        fa='hits/Holobiont_transcripts.{split}.fa',
+        db=ref_index('nr.dmnd'),
+        acc=ref_index('prot.accession2taxid.gz'),
+        nodes=ref_index('nodes.dmp'),
+    output: 'hits/Holobiont_transcripts_blast_nr__{split}.tab.gz'
+    params: db='nr'
+    threads: 16
+    shell:
+        '''
+        #. /usr/local/Modules/default/init/bash
+        #module load diamond
+        diamond_src/diamond blastx -v --compress 1 -f 6 qseqid sseqid stitle pident length qstart qend sstart send evalue staxids \
+        --range-culling --top 1 --query-cover 50 -F 15 \
+        -o {output[0]} --sensitive --query {input.fa} --db hits/{params.db} \
+        -p {threads} --taxonmap {input.acc} --taxonnodes {input.nodes} \
+        -t $TMPDIR
+        '''
+
+rule minimap_nt_split:
+    input:
+        fa='hits/Holobiont_transcripts.{split}.fa',
+        db=ref_index('nt.mmi'),
+        minimap=ref_index('minimap2-2.17_x64-linux/minimap2')
+    output: 'hits/Holobiont_transcripts_minimap_nt__{split}.tab.gz'
+    params: db='nt'
+    threads: 16
+    shell:
+        '''
+        # -2              use two I/O threads during mapping
+        # --secondary=no  only output primary alignments
+        {input.minimap} -2 --secondary=no -t {threads} {input.db} {input.fa} | gzip -c > {output}
+        '''
+
+rule concat_diamond:
+    input: expand('hits/Holobiont_transcripts_blast_nr__{split:02d}.tab.gz', split=range(nsplits))
+    output: 'Holobiont_transcripts_blast_nr.tab.gz'
+    shell:
+        'cat {input} > {output}'
+
+rule concat_minimap:
+    input: expand('hits/Holobiont_transcripts_minimap_nt__{split:02d}.tab.gz', split=range(nsplits))
+    output: 'Holobiont_transcripts_minimap_nt.tab.gz'
+    run:
+        # when minimap uses a split index, the mapQ is only accurate
+        # for hits within each split
+        # the max and best secondary chain scores are stored in the s1:i: and s2:i: tags of each
+        # primary alignment, respectively, so we can calculate the accurate mapQ for all index
+        # splits by aggregating all these scores and manually calculating the mapQ per the equation
+        # in the paper:
+        #
+        #   mapQ = round(40 * (1 - f2/f1) * min(1, m/10) * log(f1)
+        #
+        # the output is not sorted, must load all hits into memory
+
+        from collections import defaultdict, namedtuple
+        import csv
+        import gzip
+        import math
+        import re
+
+        minimap_cols = [
+            'qseqid','qlen','qstart','qend','strand',
+            'sseqid','slen','sstart','send','nmatch','nmapped','qual'
+        ]
+        patt = re.compile('cm:i:([0-9]+).*s1:i:([0-9]+).*s2:i:([0-9]+)')
+
+        query_hits = defaultdict(list)
+        for fn in input :
+            with gzip.open(fn,'rt') as f :
+                for r in f :
+                    qseqid = r.split('\t')[0]
+                    query_hits[qseqid].append(r.strip())
+
+        Hit = namedtuple('Hit',('s1','s2','cm','hit'))
+
+        with gzip.open(output[0],'wt') as outf :
+            outf = csv.writer(outf, delimiter='\t')
+            for qseqid, hits in query_hits.items() :
+                if len(hits) > 1 :
+                    # the best hit will always have the greatest s1
+                    # use the next best hit from either s1 or s2 to calculate mapQ
+                    scores = []
+                    best_score_hit = (-1,None)
+                    for hit in hits :
+                        m = patt.search(hit)
+                        if m :
+                            cm, s1, s2 = [int(_) for _ in m.groups()]
+                            scores.extend((s1,s2))
+                            best_score_hit = max(best_score_hit, Hit(s1,s2,cm,hit))
+
+                    scores.sort(reverse=True)
+                    s1, s2 = scores[:2]
+                    mapQ = int(40 * (1-s2/s1) * min(1, best_score_hit.cm/10) * math.log(s1))
+
+                    # replace the s2 from the hit with the s2 from all hits
+                    best_hit = re.sub('s2:i:[0-9]+','s2:i:{}'.format(s2),best_score_hit.hit)
+
+                    best_hit = best_hit.split('\t')
+
+                    best_hit[minimap_cols.index('qual')] = mapQ
+
+                else :
+                    best_hit = hits[0].split('\t')
+
+                outf.writerow(best_hit)

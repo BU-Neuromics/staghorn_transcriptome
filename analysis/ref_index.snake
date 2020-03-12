@@ -1,0 +1,273 @@
+workdir: 'hits'
+
+localrules: dl_minimap, download_gene2acc
+
+rule all:
+    input:
+        'nr.dmnd',
+        'nt.mmi',
+        'acc_db.sqlite3'
+
+rule download_gene2acc:
+    output: 'gene2accession.gz'
+    shell:
+        'curl ftp://ftp.ncbi.nlm.nih.gov/gene/DATA/gene2accession.gz > {output}'
+
+'''
+  1: tax_id
+  2: GeneID
+  3: status
+  4: RNA_nucleotide_accession.version
+  5: RNA_nucleotide_gi
+  6: protein_accession.version
+  7: protein_gi
+  8: genomic_nucleotide_accession.version
+  9: genomic_nucleotide_gi
+ 10: start_position_on_the_genomic_accession
+ 11: end_position_on_the_genomic_accession
+ 12: orientation
+ 13: assembly
+ 14: mature_peptide_accession.version
+ 15: mature_peptide_gi
+ 16: Symbol
+'''
+
+rule build_acc_db:
+    input:
+        gene='gene2accession.gz',
+        nucl='nucl_gb.accession2taxid.gz',
+        prot='prot.accession2taxid.gz'
+    output: 'acc_db.sqlite3'
+    run:
+        import csv
+        import gzip
+        import logging
+        from pprint import pprint
+        import sqlite3
+        logging.basicConfig(level=logging.INFO)
+
+        fields = [
+            'tax_id',
+            'GeneID',
+            'status',
+            'RNA_nucleotide_accession.version',
+            'RNA_nucleotide_gi',
+            'protein_accession.version',
+            'protein_gi',
+            'genomic_nucleotide_accession.version',
+            'genomic_nucleotide_gi',
+            'start_position_on_the_genomic_accession',
+            'end_position_on_the_genomic_accession',
+            'orientation',
+            'assembly',
+            'mature_peptide_accession.version',
+            'mature_peptide_gi',
+            'Symbol',
+        ]
+
+        con = sqlite3.connect(output[0])
+        # need to add composite key of (tax_id, RNA_nucleotide_accession, protein_accession)
+        con.execute('create table acc('
+            'id int, '
+            'tax_id int, '
+            'GeneID int, '
+            'RNA_nucleotide_accession, '
+            'protein_accession, '
+            'orientation, '
+            'Symbol, '
+            'constraint pk_id primary key (tax_id, RNA_nucleotide_accession, protein_accession)'
+        ')'
+        )
+
+        # paralogs that produce identical protein sequences have different entrez ids but
+        # the same protein id
+        # this leads to conflicts with the composite key constraint above
+        # the pipeline isn't currently configured to deal with protein hits that map to
+        # different entrez ids, I guess we can just ignore duplicates by these keys?
+        insert_sql = ('insert or ignore into acc('
+            'id,tax_id,GeneID,RNA_nucleotide_accession,'
+            'protein_accession,orientation,Symbol'
+            ') values (?,?,?,?,?,?,?)')
+
+        batch_size = 1000000
+        batch = []
+        batches = 0
+
+        r_id = 0
+
+        logging.info('loading gene2accession')
+        with gzip.open(input.gene,'rt') as f :
+            next(f) # get rid of header
+            reader = csv.DictReader(f,delimiter='\t',fieldnames=fields)
+            for r in reader :
+
+                # only care about RNA and protein
+                if r['RNA_nucleotide_accession.version'] == '-' and r['protein_accession.version'] == '-' :
+                    continue
+
+                batch.append((
+                    r_id,
+                    int(r['tax_id']),
+                    int(r['GeneID']),
+                    r['RNA_nucleotide_accession.version'],
+                    r['protein_accession.version'],
+                    r['orientation'],
+                    r['Symbol']
+                ))
+                r_id += 1
+                if len(batch) == batch_size :
+                    batches += 1
+                    logging.info('{}'.format(batches))
+                    with con:
+
+                        con.executemany(insert_sql,batch)
+
+                        batch = []
+
+                #if batches == 10 : break
+            with con:
+                con.executemany(insert_sql,batch)
+                batch = []
+
+        logging.info('loading non-gene nucleotide accessions')
+
+        with gzip.open(input.nucl,'rt') as f :
+            # file has header
+            next(f)
+            for rec in csv.reader(f,delimiter='\t') :
+                batch.append((r_id,int(rec[2]),'',rec[1],'','',''))
+                if len(batch) == batch_size :
+                    batches += 1
+                    logging.info('{}'.format(batches))
+                    with con:
+                        con.executemany(insert_sql,batch)
+                        batch = []
+                r_id += 1
+                #if batches == 20 : break
+            with con:
+                con.executemany(insert_sql,batch)
+                batch = []
+
+        logging.info('loading non-gene protein accessions')
+
+        with gzip.open(input.prot,'rt') as f :
+            # file has header
+            next(f)
+            for rec in csv.reader(f,delimiter='\t') :
+                batch.append((r_id,int(rec[2]),'','',rec[1],'',''))
+                if len(batch) == batch_size :
+                    batches += 1
+                    logging.info('{}'.format(batches))
+                    with con:
+                        con.executemany(insert_sql,batch)
+                        batch = []
+                r_id += 1
+                #if batches == 30 : break
+            with con:
+                con.executemany(insert_sql,batch)
+
+
+
+rule download_nt:
+    output: temp('{db, (nt|nr)}.gz')
+    shell:
+        'curl ftp://ftp.ncbi.nlm.nih.gov/blast/db/FASTA/{wildcards.db}.gz > {output}'
+
+rule taxdump:
+    output: 'nodes.dmp'
+    shell:
+        '''
+        wget ftp://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz
+        tar zxf taxdump.tar.gz
+        '''
+
+rule download_nucl_acc:
+    output: 'nucl_gb.accession2taxid.gz'
+    shell:
+        'wget ftp://ftp.ncbi.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz'
+
+rule download_prot_acc:
+    output: 'prot.accession2taxid.gz'
+    shell:
+        'wget ftp://ftp.ncbi.nih.gov/pub/taxonomy/accession2taxid/prot.accession2taxid.gz'
+
+rule acc_taxid_db:
+    input:
+        db='gene2accession.sqlite3',
+        nucl='nucl_gb.accession2taxid.gz',
+        prot='prot.accession2taxid.gz'
+    output:
+        db='acc_taxid_db.sqlite3'
+    run:
+        import csv
+        import gzip
+        import logging
+        import sqlite3
+        logging.basicConfig(level=logging.INFO)
+
+        con = sqlite3.connect(input.db)
+
+        batch_size = 1000000
+        batch = []
+        batches = 0
+        logging.info('writing batches to db')
+
+        insert_sql = ('insert or ignore into acc ('
+            'tax_id,GeneID,RNA_nucleotide_accession,'
+            'protein_accession,orientation,Symbol'
+            ') values (?,?,?,?,?,?)')
+
+        with gzip.open(input.nucl,'rt') as f :
+            # file has header
+            next(f)
+            for rec in csv.reader(f,delimiter='\t') :
+                batch.append((int(rec[2]),'',rec[1],'','',''))
+                if len(batch) == batch_size :
+                    batches += 1
+                    logging.info('{}'.format(batches))
+                    with con:
+                        con.executemany(insert_sql,batch)
+                        batch = []
+            with con:
+                con.executemany(insert_sql,batch)
+
+
+# for diamond
+rule diamond_nr_db:
+    input:
+        fa='nr.gz',
+        acc='prot.accession2taxid.gz',
+        nodes='nodes.dmp'
+    output: 'nr.dmnd'
+    threads: 28
+    shell:
+        '''
+        diamond makedb -v -p {threads} -d nr \
+            --in {input.fa} \
+            --taxonmap {input.acc}\
+            --taxonnodes {input.nodes} \
+            -t $TMPDIR
+        '''
+
+# for minimap
+rule dl_minimap:
+    output: 'minimap2-2.17_x64-linux/minimap2'
+    shell:
+        '''
+        curl -L https://github.com/lh3/minimap2/releases/download/v2.17/minimap2-2.17_x64-linux.tar.bz2 | tar -jxvf -
+        '''
+
+rule minimap_nt:
+    input:
+        nt='nt.gz',
+        mm='minimap2-2.17_x64-linux/minimap2'
+    output: 'nt.mmi'
+    threads: 28
+    shell:
+        '''
+        # -I 16G
+        # --idx-no-seq  Don’t store target sequences in the index. It saves disk space and memory
+        {input.mm} -I 16G --idx-no-seq -t {threads} -d {output} {input.nt}
+        '''
+
+

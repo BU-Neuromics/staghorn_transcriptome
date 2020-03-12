@@ -1,4 +1,13 @@
-from pprint import pprint
+from pprint import pprint, pformat
+
+subworkflow hits:
+    configfile: 'blank.conf'
+    snakefile: 'hits.snake'
+
+subworkflow ref_index:
+    configfile: 'blank.conf'
+    snakefile: 'ref_index.snake'
+    workdir: 'hits'
 
 samples = ('B2','B11','B12','B22','F12','F18','F22','F23')
 
@@ -9,7 +18,7 @@ taxonids = {
     'smb': '252141',
     'meta': '33208',
     'euk': '2759',
-    'archea': '2157',
+    'archaea': '2157',
     'fungi': '4751',
     'bacteria': '2',
     'virus': '10239',
@@ -37,23 +46,10 @@ rule all:
     input:
         'Holobiont_transcripts.fa',
         'Holobiont_cdhit.fa.clstr',
-        'Holobiont_transcripts_blast_all.tab.gz',
-        'Holobiont_transcripts_all_blast.fa',
-        taxclass_fa,
-        #expand('Allsite_{org}_cdhit.fasta', org=('cni','smb','other'))
-        #'Holobiont_transcripts_blast_annot.csv',
-        #expand('Holobiont_transcripts_{org}.fa',org=taxonids),
-        #'Holobiont_transcripts_other.fa',
-        expand('{sample}__salmon_quant/quant.genes.sf',
-            org=('cni','smb'),
-            sample=samples
-        ),
-        'all_salmon_quant.csv',
-        taxclass_counts,
-        filt_taxclass,
-        de_taxclass
-        #expand('filt_salmon_quant_{org}.csv',org=('cni','smb')),
-        #expand('de_site_{org}.csv',org=('cni','smb'))
+        'Holobiont_transcripts_blast_nr_hits.csv.gz',
+        'Holobiont_transcripts_minimap_nt_hits.csv.gz',
+        'Holobiont_transcripts_hits.gtf',
+        taxclass_fa
 
 rule build_taxa_graph:
     input: '../nodes.dmp',
@@ -209,127 +205,211 @@ rule cdhit_clustermap:
                             'exemplar': False
                         }
 
-                    if d['qseqid'] == 'Acer_CC1_Locus_123719_Transcript_1of1_Confidence_1.000_Length_156' :
-                        pprint(d)
                     curr_cluster.append(d)
             add_to_map(curr_cluster)
 
         with open(output[0], 'wt') as f :
             json.dump(cluster_map,f,indent=2)
 
-rule diamond_all_taxa:
-    input: 'Holobiont_transcripts.fa'
-    output: 'Holobiont_transcripts_blast_all.tab.gz'
-    threads: 28
-    shell:
-        '''
-        . /usr/local/Modules/default/init/bash
-        module load diamond
-        diamond blastx -v --compress 1 -f 6 qseqid sseqid stitle pident length qstart qend sstart send evalue staxids \
-        --range-culling --top 10 --query-cover 50 -F 15 \
-        -o {output[0]} --sensitive --query {input[0]} --db ../nr \
-        -p {threads} --taxonmap diamond_db/prot.accession2taxid.gz --taxonnodes diamond_db/nodes.dmp
-        '''
-
-rule subdivide_all_blast:
+rule blast_to_hits:
     input:
-        fa='Holobiont_transcripts.fa',
-        blast=rules.diamond_all_taxa.output[0],
-        taxa='subtaxa.json',
-        clstr='Holobiont_cdhit.fa.clstr.map.json'
+        blast=hits('Holobiont_transcripts_blast_nr.tab.gz'),
+        acc=ref_index('gene2accession.sqlite3'),
+        taxid=ref_index('acc_taxid_db')
     output:
-        fa='Holobiont_transcripts_all_blast.fa',
-        nohit='Holobiont_transcripts_all_nohit.fa',
-        gtf='Holobiont_transcripts_all_blast.gtf'
+        'Holobiont_transcripts_blast_nr_hits.csv.gz'
     run:
-        from collections import defaultdict, Counter
+        from annotate_transcripts import hits_fields
         import csv
-        import json
+        import dbm
         import gzip
-        import pandas
-        import sys
+        import math
+        import sqlite3
 
-        stats = Counter()
-
-        transcripts = defaultdict(str)
-        with open(input.fa,'rt') as f :
-            curr_header = None
-            for i, line in enumerate(f) :
-                line = line.strip()
-                if line.startswith('>') :
-                    curr_header = line[1:]
-                else :
-                    transcripts[curr_header] += line
-            stats['transcripts'] = len(transcripts)
-        print('read transcriptome, {} sequences'.format(len(transcripts)))
-
-        with open(input.taxa, 'rt') as f :
-            taxa = {k:set(v) for k,v in json.load(f).items()}
-
-        with open(input.clstr,'rt') as f :
-            cluster_map = json.load(f)
-        stats['num cluster sequences'] = len(cluster_map)
-        stats['num clusters'] = len(set([_['parent_tid'] for _ in cluster_map.values()]))
-
-        annot = defaultdict(list)
         blast_cols = [
             'qseqid', 'sseqid', 'stitle', 'pident', 'length',
             'qstart', 'qend', 'sstart', 'send', 'evalue', 'staxid'
         ]
 
-        def cast_fields(r) :
-            for f in ('length','qstart','qend','sstart','send') :
-                r[f] = int(r[f])
-            r['evalue'] = float(r['evalue'])
-            return r
+        con = sqlite3.connect(input.acc)
 
-        # read blast output
-        i = 0
-        with gzip.open(input.blast,'rt') as f :
-            for i,r in enumerate(csv.DictReader(f,blast_cols,delimiter='\t')) :
-                annot[r['qseqid']].append(cast_fields(r))
-                #i += 1
-                #if i == 1000 : break
-            stats['num blast records'] = i
-            stats['num transcripts with hits'] = len(annot)
+        with gzip.open(output[0],'wt') as f :
+            fout = csv.DictWriter(f,fieldnames=hits_fields)
+            with gzip.open(input.blast,'rt') as f :
+                for r in csv.DictReader(f,blast_cols,delimiter='\t') :
 
-        def pick_best_hit(hits) :
+                    r_acc = {}
 
-            min_evalue = min([_['evalue'] for _ in hits])
-            best_hits = [_ for _ in hits if _['evalue'] == min_evalue]
+                    with con :
+                        c = con.execute('SELECT '
+                            'GeneID, RNA_nucleotide_accession, protein_accession, Symbol '
+                            'FROM acc WHERE protein_accession=?',
+                            r['sseqid']
+                        )
+                        res = c.fetchall()
+                        if len(res) >= 1 :
+                            if len(res) > 1 :
+                                logging.warn('{} rows matching protein accession {}, picking first'.format(len(res),r['sseqid']))
+                            r_acc = dict(zip(
+                                ['GeneID','RNA_nucleotide_accession','protein_accession','Symbol'],
+                                res[0]
+                            ))
+                            r_acc = {k:v for k,v in r_acc.items() if v}
 
-            def filter_by_title_text(l,text) :
-                kept = [_ for _ in best_hits if text not in _['stitle']]
-                if len(kept) > 0 :
-                    return kept
-                return l
+                    evalue = float(r['evalue'])
+                    if evalue == 0 :
+                        score = 255
+                    else :
+                        score = -math.log10(evalue)
+                    fout.writerow({
+                        'qseqid': r['qseqid'],
+                        'qlen': r['qseqid'].split('_')[-1],
+                        'qstart': r['qstart'],
+                        'qend': r['qend'],
+                        'gene_id': r_acc.get('GeneID',r['sseqid']),
+                        'slen': r['length'],
+                        'sstart': r['sstart'],
+                        'send': r['send'],
+                        'gene_desc': r['stitle'],
+                        'rna_acc': r_acc.get('RNA_nucleotide_accession',''),
+                        'protein_acc': r_acc.get('protein_accession',r['sseqid']),
+                        'gene_symbol': r_acc.get('Symbol',''),
+                        'staxids': r['staxid'],
+                        'score': score
+                    })
 
-            # prefer hits that don't have PREDICTED in the title
-            if len(best_hits) > 1 :
-                best_hits = filter_by_title_text(hits,'PREDICTED')
+rule minimap_to_hits:
+    input:
+        minimap=hits('Holobiont_transcripts_minimap_nt.tab.gz'),
+        acc=ref_index('gene2accession.sqlite3'),
+        taxid=ref_index('acc_taxid_db.sqlite3')
+    output:
+        'Holobiont_transcripts_minimap_nt_hits.csv.gz'
+    run:
+        from annotate_transcripts import hits_fields
+        import csv
+        import gzip
+        import logging
+        import sqlite3
+        logging.basicConfig(level=logging.INFO)
 
-            # prefer hits that don't have LOW QUALITY PROTEIN in the title
-            if len(best_hits) > 1 :
-                best_hits = filter_by_title_text(hits,'LOW QUALITY PROTEIN')
+        minimap_cols = [
+            'qseqid','qlen','qstart','qend','strand',
+            'sseqid','slen','sstart','send','nmatch','nmapped','qual'
+        ]
 
-            # prefer hits that don't have hypothetical protein in the title
-            if len(best_hits) > 1 :
-                best_hits = filter_by_title_text(hits,'hypothetical protein')
+        acc_con = sqlite3.connect(input.acc)
+        tax_con = sqlite3.connect(input.taxid)
 
-            # otherwise just return first (i.e. random) hit
-            return best_hits[0]
+        with gzip.open(output[0],'wt') as f :
+            fout = csv.DictWriter(f,fieldnames=hits_fields)
+            with gzip.open(input.minimap,'rt') as f :
+                for r in csv.reader(f,delimiter='\t') :
 
-        # then process each transcript hits to map to a single sseqid
-        # and write out the annotated sequences to file
-        # also compute the taxonomic class, and make sure there is only one
-        # per transcript
+                    # one of the fields looks like s1:i:[0-9]+
+                    score = [_[5:] for _ in r[len(minimap_cols):] if _.startswith('s1:i:')]
+
+                    r = dict(zip(minimap_cols, r[:len(minimap_cols)]))
+
+                    r_acc = {}
+
+                    with acc_con :
+                        c = acc_con.execute('SELECT '
+                            'GeneID, RNA_nucleotide_accession, protein_accession, Symbol '
+                            'FROM acc WHERE RNA_nucleotide_accession=?',
+                            (r['sseqid'],)
+                        )
+                        res = c.fetchall()
+                        if len(res) >= 1 :
+                            if len(res) > 1 :
+                                logging.warn('{} rows matching protein accession {}, picking first'.format(len(res),r['sseqid']))
+                            r_acc = dict(zip(
+                                ['GeneID','RNA_nucleotide_accession','protein_accession','Symbol'],
+                                c.fetchone()
+                            ))
+                            r_acc = {k:v for k,v in r_acc.items() if v}
+
+                    staxids = r_acc.get('tax_id')
+                    if not staxids :
+                        logging.info('no tax_id in gene2acc, searching nucl_gb db for {}'.format(r['sseqid']))
+                        with tax_con:
+                            c = tax_con.execute('SELECT taxid FROM acc WHERE acc=?', (r['sseqid'],))
+                            res = c.fetchall()
+                            if len(res) == 1 :
+                                staxids = res[0][0]
+                            elif c.rowcount > 1 :
+                                staxids = ';'.join([_[0] for _ in res])
+                            if staxids :
+                                logging.info('mapped {} to taxids {}'.format(r['sseqid'],staxids))
+                            else :
+                                logging.info('no taxid mapping for {}!'.format(r['sseqid']))
+
+                    assert (r['qseqid'].startswith('Acer') or staxids is not None)
+
+                    fout.writerow({
+                        'qseqid': r['qseqid'],
+                        'qlen': r['qlen'],
+                        'qstart': r['qstart'],
+                        'qend': r['qend'],
+                        'gene_id': r_acc.get('GeneID',r['sseqid']),
+                        'slen': r['slen'],
+                        'sstart': r['sstart'],
+                        'send': r['send'],
+                        'gene_desc': '',
+                        'rna_acc': r_acc.get('RNA_nucleotide_accession.version',r['sseqid']),
+                        'protein_acc': r_acc.get('protein_accession.version',''),
+                        'gene_symbol': r_acc.get('Symbol',''),
+                        'staxids': staxids or '',
+                        'score': 0 if len(score) == 0 else score[0]
+                    })
+
+
+rule map_hits_to_taxclass:
+    input:
+        fa='Holobiont_transcripts.fa',
+        nr='Holobiont_transcripts_blast_nr_hits.csv.gz',
+        nt='Holobiont_transcripts_minimap_nt_hits.csv.gz',
+        taxa='subtaxa.json',
+        clstr='Holobiont_cdhit.fa.clstr.map.json'
+    output:
+        gtf='Holobiont_transcripts_hits.gtf',
+        nohitfa='Holobiont_transcripts_nohit.fa.gz'
+    run:
+        import annotate_transcripts as at
+        #   annotate_transcripts
+        #   clustered_transcript_hits,
+        #   hits_to_gtf
+        #   nohits_to_fa
+
+        from Bio import SeqIO
+        import csv
+        import gzip
+        import logging
+        logging.basicConfig(level=logging.INFO)
+
+        logging.info('loading transcripts')
+        transcripts = {}
+        for rec in SeqIO.parse(input.fa,'fasta') :
+            transcripts[rec.id] = rec
+
+        logging.info('loading blast hits')
+        with gzip.open(input.nr,'rt') as f :
+            blast_hits = [_ for _ in csv.DictReader(f,fieldnames=at.hits_fields)]
+
+        logging.info('loading taxa tree')
+        with open(input.taxa, 'rt') as f :
+            taxa = {k:set(v) for k,v in json.load(f).items()}
+
+        logging.info('loading cluster map')
+        with open(input.clstr,'rt') as f :
+            cluster_map = json.load(f)
 
         # some hits have more than one taxid that map to different classes
         # prioritize more general classes over more specific ones
         class_priority = (
             'bacteria',
             'fungi',
-            'archea',
+            'archaea',
             'virus',
             'org_other',
             'other_seqs',
@@ -340,123 +420,93 @@ rule subdivide_all_blast:
         )
         class_priority = list(zip(range(len(class_priority)),class_priority))
 
-        pids = defaultdict(list)
-        with open(output.fa,'wt') as f :
-            for tid, hits in annot.items() :
-                best_hit = pick_best_hit(hits)
-                best_hit['source'] = 'blast'
+        logging.info('mapping blast results')
+        # map blast results
+        nr_map = at.annotate_transcripts(
+            transcripts.keys(),
+            blast_hits,
+            taxa,
+            class_priority,
+            cluster_map,
+            'blast'
+        )
+        logging.info(pformat(nr_map['stats']))
 
-                # set the annot key for this tid to the best hit for use in
-                # no hit resolution next step
-                annot[tid] = best_hit
+        logging.info('loading minimap hits for blast nohits')
+        # only pull hits from blast nohits
+        minimap_hits = []
+        with gzip.open(input.nt,'rt') as f :
+            for hit in csv.DictReader(f,fieldnames=at.hits_fields) :
+                if hit['qseqid'] in nr_map['nohits'] :
+                    minimap_hits.append(hit)
 
-                # some proteins have multiple taxon ids, not sure why
-                classes = []
-                for taxonid in best_hit['staxid'].split(';') :
-                    classes.extend([k for k,v in taxa.items() if taxonid in v])
-                classes = list(set(classes))
+        logging.info('mapping minimap hits')
+        # map nohit results to nt
+        nohit_nt_map = at.annotate_transcripts(
+            nr_map['nohits'],
+            minimap_hits,
+            taxa,
+            class_priority,
+            cluster_map,
+            'minimap'
+        )
+        logging.info(pformat(nohit_nt_map['stats']))
 
-                if len(classes) == 0 : # no taxid, despite blast hit? map to other
-                    stats['no hit classes found'] += 1
-                    classes.append('org_other')
-                if len(classes) > 1 : # multiple classes
+        logging.info('sanity checks')
+        # sanity check make sure we didn't reannotate anything
+        common_annot = set(nr_map['annot']).intersection(nohit_nt_map['annot'])
+        assert len(common_annot) == 0
 
-                    #print(
-                    #    'tid={}, '.format(tid),
-                    #    'pid={}, '.format(best_hit['sseqid']),
-                    #    'staxid={}, '.format(best_hit['staxid']),
-                    #    'classes={}'.format(classes)
-                    #)
+        # make sure nt nohits aren't annotated in nr_map
+        nohit_nr_nt = set(nr_map['annot']).intersection(nohit_nt_map['nohits'])
+        assert len(nohit_nr_nt) == 0
 
-                    priority_class = min((p,c) for p,c in class_priority if c in classes)
-                    #print('multiple classes, prioritizing {}'.format(priority_class))
+        logging.info('writing nohit fasta, {} nohit sequences'.format(
+            len(nohit_nt_map['nohits']))
+        )
+        with gzip.open(output.nohitfa,'wt') as f :
+            SeqIO.write([transcripts[_] for _ in nohit_nt_map['nohits']],f,'fasta')
 
-                    classes = [priority_class[1]]
+        logging.info('clustering nohits')
+        # cluster the remaining nohits
+        nohit_cluster_hits = at.clustered_transcript_hits(
+            nohit_nt_map['nohits'],
+            cluster_map
+        )
 
-                    stats['multiple taxclasses'] += 1
+        logging.info('merging all hits')
+        all_hits = at.merge_hits(
+            nr_map['hits'],
+            nohit_nt_map['hits'],
+            nohit_cluster_hits
+        )
+        logging.info('total hits: {}'.format(len(all_hits)))
+        logging.info('total transcripts in gtf: {}'.format(sum([len(v) for v in all_hits.values()])))
+        logging.info('total transcripts in hits: {}'.format(
+            sum([len(v) for k,v in all_hits.items() if not k.startswith('Acer')])
+        ))
+        logging.info('total transcripts with no hits: {}'.format(
+            sum([len(v) for k,v in all_hits.items() if k.startswith('Acer')])
+        ))
 
-                assert len(classes) == 1
-
-                best_hit['taxclass'] = classes[0]
-                name = best_hit['name'] = '{}|{}|{}'.format(tid,classes[0],best_hit['sseqid'])
-                pids[best_hit['sseqid']].append(best_hit)
-
-                f.write('>{}\n{}\n'.format(name,transcripts[tid]))
-
-            # now attempt to map tids with no hits to their parent tids
-            nohit_tids = set(transcripts).difference(set(annot))
-            nohit_clusters = defaultdict(list)
-
-            for tid in nohit_tids :
-                tid_cluster = cluster_map[tid]
-                parent_tid = tid_cluster['parent_tid']
-                if parent_tid in annot :
-                    # the parent sequence of this tid's cluster has a hit, assign it to tid
-                    parent_hit = annot[parent_tid]
-                    tid_cluster.update({
-                        'stitle': parent_hit['stitle'],
-                        'staxid': parent_hit['staxid'],
-                        'taxclass': parent_hit['taxclass'],
-                        'source': 'blast'
-                    })
-                    pids[parent_hit['sseqid']].append(tid_cluster)
-                    stats['nohit mapped to parent hit'] += 1
-                else :
-                    # this parent's tid had no hit, make a new cluster
-                    tid_cluster.update({
-                        'stitle': parent_tid,
-                        'staxid': 'na',
-                        'taxclass': 'nohit',
-                        'source': 'cdhit'
-                    })
-                    pids[parent_tid].append(tid_cluster)
-                    stats['nohit mapped to orphan cluster'] += 1
-
-        pprint(stats)
-
-        with open(output.gtf,'wt') as g :
-            g_out = csv.writer(g,delimiter='\t', quoting=csv.QUOTE_NONE,quotechar='')
-            for pid,hits in pids.items() :
-                df = pandas.DataFrame(hits)
-                df.index = df['qseqid']
-                g_out.writerow([
-                    pid,df.iloc[0].get('source','blast'),'gene',
-                    int(df['sstart'].min()),int(df['send'].max()),
-                    '.','.','.',
-                    'gene_id "{}"; gene_name "{}"; taxa_ids "{}"; taxclass "{}";'.format(
-                        pid, df.iloc[0]['stitle'], df.iloc[0]['staxid'], df.iloc[0]['taxclass']
-                    )
-                ])
-                for tid,r in df.sort_values('sstart').iterrows()  :
-                    site = tid[5:7]
-                    g_out.writerow([
-                        pid,site,'transcript',
-                        int(r['sstart']),int(r['send']),
-                        '.','.','.',
-                        'gene_id "{}"; transcript_id "{}"; site "{}"; taxids "{}"; taxclass "{}";'.format(
-                            pid, r['qseqid'], site, r['staxid'], r['taxclass']
-                        )
-                    ])
-
-        # now write out the sequences that didn't have any blast hits to their own file
-        with open(output.nohit,'wt') as f :
-            nohit_tids = set(transcripts).difference(set(annot))
-            for tid in nohit_tids :
-                f.write('>{}\n{}\n'.format(tid,transcripts[tid]))
+        logging.info('writing hit gtf')
+        at.hits_to_gtf(all_hits,output.gtf)
 
 rule sort_fasta:
     input:
         fa='Holobiont_transcripts.fa',
-        gtf='Holobiont_transcripts_all_blast.gtf'
+        gtf='Holobiont_transcripts_hits.gtf'
     output:
         taxclass_fa
     run:
+        from Bio import SeqIO
         import csv
         import gzip
         import re
 
         tid_patt = re.compile('transcript_id "([^"]*)"')
         taxclass_patt = re.compile('taxclass "([^"]*)"')
+        taxon_patt = re.compile('taxids "([^"]*)"')
 
         taxclass_map = {}
         with open(input.gtf,'rt') as f :
@@ -464,35 +514,28 @@ rule sort_fasta:
                 feature = r[2]
                 if feature == 'transcript' :
                     tid = tid_patt.search(r[-1]).group(1)
-                    taxclass = taxclass_patt.search(r[-1]).group(1)
-                    taxclass_map[tid] = taxclass
-
-        print(list(taxclass_map.items())[:10])
-
-        def fasta_itr(f) :
-            curr_header = None
-            curr_seq = []
-            for r in f :
-                if r.startswith('>') :
-                    if curr_header is not None :
-                        yield curr_header, ''.join(curr_seq)
-                    curr_header = r[1:].strip()
-                    curr_seq = []
-                else :
-                    curr_seq.append(r.strip())
-            yield curr_header, ''.join(curr_seq)
+                    taxclass = taxclass_patt.search(r[-1])
+                    taxclass = taxclass.group(1) if taxclass is not None else 'nohit'
+                    taxa = taxon_patt.search(r[-1]).group(1)
+                    taxclass_map[tid] = {
+                        'taxclass': taxclass,
+                        'taxonIDs': taxa
+                    }
 
         with open(input.fa,'rt') as f :
-
 
             # open all the file pointers
             fps = {}
             for tc in taxclasses :
                 fps[tc] = gzip.open('taxclass_fa/taxclass_{}_transcripts.fa.gz'.format(tc),'wt')
 
-            for h,s in fasta_itr(f) :
-                taxclass = taxclass_map[h]
-                fps[taxclass].write('>{}\n{} {}\n'.format(h,s,taxclass))
+            for rec in SeqIO.parse(f,'fasta') :
+                taxinfo = taxclass_map[rec.id]
+                fps[taxinfo['taxclass']].write(
+                    '>{}_{} taxclass={} taxids={}\n{}\n'.format(
+                        rec.id,taxinfo['taxclass'],taxinfo['taxclass'],taxinfo['taxonIDs'],rec.sequence
+                    )
+                )
 
         [_.close() for _ in fps.values()]
 
@@ -507,8 +550,8 @@ rule salmon_index:
         'salmon index -p {threads} --index {output[0]} -t {input}'
 
 rule genemap:
-    input: 'Holobiont_transcripts_all_blast.gtf'
-    output: 'Holobiont_transcripts_all_blast_tidmap.csv'
+    input: 'Holobiont_transcripts_blast_{db}.gtf'
+    output: 'Holobiont_transcripts_blast_{db}_tidmap.csv'
     run:
         import csv
         import re
@@ -530,7 +573,7 @@ rule salmon_quant:
     input:
         r1='{sample}_R1trim.fq',
         r2='{sample}_R2trim.fq',
-        tidmap='Holobiont_transcripts_all_blast_tidmap.csv',
+        tidmap='Holobiont_transcripts_blast_tidmap.csv',
         index='Holobiont_transcripts__salmon_index'
     output:
         '{sample}__salmon_quant/quant.genes.sf'
