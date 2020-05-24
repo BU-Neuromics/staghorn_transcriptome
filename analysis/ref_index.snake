@@ -68,26 +68,19 @@ rule build_acc_db:
         con = sqlite3.connect(output[0])
         # need to add composite key of (tax_id, RNA_nucleotide_accession, protein_accession)
         con.execute('create table acc('
-            'id int, '
             'tax_id int, '
             'GeneID int, '
-            'RNA_nucleotide_accession, '
-            'protein_accession, '
-            'orientation, '
+            'acc, '
+            'mol, '
             'Symbol, '
-            'constraint pk_id primary key (tax_id, RNA_nucleotide_accession, protein_accession)'
+            'constraint acc_tax unique (tax_id, acc)'
         ')'
         )
+        con.execute('create index acc_ind on acc (acc)')
 
-        # paralogs that produce identical protein sequences have different entrez ids but
-        # the same protein id
-        # this leads to conflicts with the composite key constraint above
-        # the pipeline isn't currently configured to deal with protein hits that map to
-        # different entrez ids, I guess we can just ignore duplicates by these keys?
         insert_sql = ('insert or ignore into acc('
-            'id,tax_id,GeneID,RNA_nucleotide_accession,'
-            'protein_accession,orientation,Symbol'
-            ') values (?,?,?,?,?,?,?)')
+            'tax_id,GeneID,acc,mol,Symbol'
+            ') values (?,?,?,?,?)')
 
         batch_size = 1000000
         batch = []
@@ -102,27 +95,38 @@ rule build_acc_db:
             for r in reader :
 
                 # only care about RNA and protein
-                if r['RNA_nucleotide_accession.version'] == '-' and r['protein_accession.version'] == '-' :
-                    continue
+                if r['RNA_nucleotide_accession.version'] != '-' :
+                    rec = (
+                        #r_id,
+                        int(r['tax_id']),
+                        int(r['GeneID']),
+                        r['RNA_nucleotide_accession.version'],
+                        'n',
+                        r['Symbol']
+                    )
+                    batch.append([_ if _ != '-' else None for _ in rec])
+                    r_id += 1
 
-                batch.append((
-                    r_id,
-                    int(r['tax_id']),
-                    int(r['GeneID']),
-                    r['RNA_nucleotide_accession.version'],
-                    r['protein_accession.version'],
-                    r['orientation'],
-                    r['Symbol']
-                ))
-                r_id += 1
-                if len(batch) == batch_size :
+                if r['protein_accession.version'] != '-' :
+                    rec = (
+                        #r_id,
+                        int(r['tax_id']),
+                        int(r['GeneID']),
+                        r['protein_accession.version'],
+                        'p',
+                        r['Symbol']
+                    )
+                    batch.append([_ if _ != '-' else None for _ in rec])
+                    r_id += 1
+
+                if len(batch) > batch_size :
                     batches += 1
                     logging.info('{}'.format(batches))
                     with con:
 
                         con.executemany(insert_sql,batch)
 
-                        batch = []
+                    batch = []
 
                 #if batches == 10 : break
             with con:
@@ -135,7 +139,7 @@ rule build_acc_db:
             # file has header
             next(f)
             for rec in csv.reader(f,delimiter='\t') :
-                batch.append((r_id,int(rec[2]),'',rec[1],'','',''))
+                batch.append((int(rec[2]),None,rec[1],'n',None))
                 if len(batch) == batch_size :
                     batches += 1
                     logging.info('{}'.format(batches))
@@ -154,7 +158,7 @@ rule build_acc_db:
             # file has header
             next(f)
             for rec in csv.reader(f,delimiter='\t') :
-                batch.append((r_id,int(rec[2]),'','',rec[1],'',''))
+                batch.append((int(rec[2]),None,rec[1],'p',None))
                 if len(batch) == batch_size :
                     batches += 1
                     logging.info('{}'.format(batches))
@@ -165,8 +169,45 @@ rule build_acc_db:
                 #if batches == 30 : break
             with con:
                 con.executemany(insert_sql,batch)
+rule get_gene_info:
+    output: 'All_Data.gene_info.gz'
+    shell:
+        'wget https://ftp.ncbi.nih.gov/gene/DATA/GENE_INFO/All_Data.gene_info.gz'
 
-
+rule build_entrez_db:
+    input: 'All_Data.gene_info.gz'
+    output: 'entrez_db.sqlite3'
+    shell:
+        '''
+        # I have no idea why the zcat command fails with nonzero exit status
+        # in snakemake, but it does what it is supposed to do
+        set +euo pipefail
+        zcat {input} > All_Data.gene_info.csv
+        set -euo pipefail
+        sqlite3 {output} <<EOF
+CREATE TABLE gene_info (
+    tax_id,
+    GeneID PRIMARY KEY,
+    Symbol,
+    LocusTag,
+    Synonyms,
+    dbXrefs,
+    chromosome,
+    map_location,
+    description,
+    type_of_gene,
+    Symbol_from_nomenclature_authority,
+    Full_name_from_nomenclature_authority,
+    Nomenclature_status,
+    Other_designations,
+    Modification_date,
+    Feature_type
+);
+.separator "	"
+.import All_Data.gene_info.csv gene_info
+EOF
+        rm All_Data.gene_info.csv
+        '''
 
 rule download_nt:
     output: temp('{db, (nt|nr)}.gz')
