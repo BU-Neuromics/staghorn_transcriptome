@@ -30,7 +30,7 @@ taxclasses.remove('euk')
 taxclasses.remove('meta')
 taxclasses.extend(['meta_other','euk_other','org_other','nohit'])
 
-taxclass_fa = expand('taxclass_fa/taxclass_{taxclass}_transcripts.fa.gz',
+taxclass_fa = expand('taxclass_fa/taxclass_{taxclass}_transcripts.fa',
     taxclass=taxclasses
 )
 
@@ -49,10 +49,12 @@ rule all:
         'Holobiont_transcripts_blast_nr_hits.csv.gz',
         'Holobiont_transcripts_minimap_nt_hits.csv.gz',
         'Holobiont_transcripts_hits.gtf',
+        'Holobiont_transcripts_hits_tidmap.csv',
+        'Holobiont_transcripts_hits_gene_annotation.csv',
         taxclass_fa
 
 rule build_taxa_graph:
-    input: '../nodes.dmp',
+    input: 'hits/nodes.dmp',
     output: 'subtaxa.json'
     run:
         import csv
@@ -214,17 +216,17 @@ rule cdhit_clustermap:
 rule blast_to_hits:
     input:
         blast=hits('Holobiont_transcripts_blast_nr.tab.gz'),
-        acc=ref_index('gene2accession.sqlite3'),
-        taxid=ref_index('acc_taxid_db')
+        acc=ref_index('acc_db.sqlite3')
     output:
         'Holobiont_transcripts_blast_nr_hits.csv.gz'
     run:
         from annotate_transcripts import hits_fields
         import csv
-        import dbm
         import gzip
         import math
+        import logging
         import sqlite3
+        logging.basicConfig(level=logging.INFO)
 
         blast_cols = [
             'qseqid', 'sseqid', 'stitle', 'pident', 'length',
@@ -232,6 +234,7 @@ rule blast_to_hits:
         ]
 
         con = sqlite3.connect(input.acc)
+        i = 0
 
         with gzip.open(output[0],'wt') as f :
             fout = csv.DictWriter(f,fieldnames=hits_fields)
@@ -242,16 +245,16 @@ rule blast_to_hits:
 
                     with con :
                         c = con.execute('SELECT '
-                            'GeneID, RNA_nucleotide_accession, protein_accession, Symbol '
-                            'FROM acc WHERE protein_accession=?',
-                            r['sseqid']
+                            'GeneID, acc, Symbol '
+                            'FROM acc WHERE acc=?',
+                            (r['sseqid'],)
                         )
                         res = c.fetchall()
                         if len(res) >= 1 :
                             if len(res) > 1 :
                                 logging.warn('{} rows matching protein accession {}, picking first'.format(len(res),r['sseqid']))
                             r_acc = dict(zip(
-                                ['GeneID','RNA_nucleotide_accession','protein_accession','Symbol'],
+                                ['GeneID','acc','Symbol'],
                                 res[0]
                             ))
                             r_acc = {k:v for k,v in r_acc.items() if v}
@@ -271,18 +274,21 @@ rule blast_to_hits:
                         'sstart': r['sstart'],
                         'send': r['send'],
                         'gene_desc': r['stitle'],
-                        'rna_acc': r_acc.get('RNA_nucleotide_accession',''),
-                        'protein_acc': r_acc.get('protein_accession',r['sseqid']),
+                        'rna_acc': None,
+                        'protein_acc': r_acc.get('acc',r['sseqid']),
                         'gene_symbol': r_acc.get('Symbol',''),
                         'staxids': r['staxid'],
                         'score': score
                     })
 
+                    if i % 1000 == 0 : logging.info(i)
+                    i += 1
+
 rule minimap_to_hits:
     input:
         minimap=hits('Holobiont_transcripts_minimap_nt.tab.gz'),
-        acc=ref_index('gene2accession.sqlite3'),
-        taxid=ref_index('acc_taxid_db.sqlite3')
+        acc=ref_index('acc_db.sqlite3'),
+        gene_info=ref_index('entrez_db.sqlite3')
     output:
         'Holobiont_transcripts_minimap_nt_hits.csv.gz'
     run:
@@ -290,6 +296,7 @@ rule minimap_to_hits:
         import csv
         import gzip
         import logging
+        from pprint import pprint, pformat
         import sqlite3
         logging.basicConfig(level=logging.INFO)
 
@@ -299,12 +306,15 @@ rule minimap_to_hits:
         ]
 
         acc_con = sqlite3.connect(input.acc)
-        tax_con = sqlite3.connect(input.taxid)
 
+        gene_con = sqlite3.connect(input.gene_info)
+
+        i = 0
         with gzip.open(output[0],'wt') as f :
             fout = csv.DictWriter(f,fieldnames=hits_fields)
             with gzip.open(input.minimap,'rt') as f :
                 for r in csv.reader(f,delimiter='\t') :
+                    logging.debug(pformat(r))
 
                     # one of the fields looks like s1:i:[0-9]+
                     score = [_[5:] for _ in r[len(minimap_cols):] if _.startswith('s1:i:')]
@@ -313,55 +323,77 @@ rule minimap_to_hits:
 
                     r_acc = {}
 
+                    staxids = None
                     with acc_con :
+                        logging.debug('running query')
                         c = acc_con.execute('SELECT '
-                            'GeneID, RNA_nucleotide_accession, protein_accession, Symbol '
-                            'FROM acc WHERE RNA_nucleotide_accession=?',
+                            'tax_id, GeneID, acc, Symbol '
+                            'FROM acc WHERE acc=?',
                             (r['sseqid'],)
                         )
                         res = c.fetchall()
+                        logging.debug('done with query')
                         if len(res) >= 1 :
+
+                            staxids = ';'.join(set([str(_[0]) for _ in res]))
+
                             if len(res) > 1 :
-                                logging.warn('{} rows matching protein accession {}, picking first'.format(len(res),r['sseqid']))
+                                logging.warn('{} rows matching protein accession {}, picking the one with the most information'.format(len(res),r['sseqid']))
+                                logging.info('choices: {}'.format(pformat(res)))
+                                res = sorted(res,key=lambda x: sum([_ is None for _ in res]))
+                                logging.info('picked: {}'.format(pformat(res[0])))
+
                             r_acc = dict(zip(
-                                ['GeneID','RNA_nucleotide_accession','protein_accession','Symbol'],
-                                c.fetchone()
+                                ['tax_id','GeneID','accession','Symbol'],
+                                res[0]
                             ))
                             r_acc = {k:v for k,v in r_acc.items() if v}
-
-                    staxids = r_acc.get('tax_id')
-                    if not staxids :
-                        logging.info('no tax_id in gene2acc, searching nucl_gb db for {}'.format(r['sseqid']))
-                        with tax_con:
-                            c = tax_con.execute('SELECT taxid FROM acc WHERE acc=?', (r['sseqid'],))
-                            res = c.fetchall()
-                            if len(res) == 1 :
-                                staxids = res[0][0]
-                            elif c.rowcount > 1 :
-                                staxids = ';'.join([_[0] for _ in res])
-                            if staxids :
-                                logging.info('mapped {} to taxids {}'.format(r['sseqid'],staxids))
-                            else :
-                                logging.info('no taxid mapping for {}!'.format(r['sseqid']))
+                            r_acc['tax_id'] = staxids
 
                     assert (r['qseqid'].startswith('Acer') or staxids is not None)
+
+                    gene_id = r_acc.get('GeneID',r['sseqid'])
+                    gene_desc = None
+                    logging.info('gene id for acc={}: {}'.format(r['sseqid'],gene_id))
+                    with gene_con :
+                        logging.info('getting gene description for gene id: {}'.format(gene_id))
+                        # I know this isn't good practice, but using a query template doesn't
+                        # return records for some unknown reason, probably due to the column datatype inference
+                        # sqlite does
+                        c = gene_con.execute('SELECT description '
+                            'FROM gene_info WHERE GeneID="{}"'.format(gene_id)
+                        )
+
+                        res = c.fetchall()
+                        logging.info('done searching for gene description, found {} records'.format(len(res)))
+
+                        if len(res) > 0 :
+                            logging.info('found gene info: {}'.format(res))
+                            if len(res) > 1 :
+                                logging.error('Too many results for gene id {}'.format(gene_id))
+                                logging.error(pformat(res))
+                                assert False
+                            gene_desc = res[0][0]
 
                     fout.writerow({
                         'qseqid': r['qseqid'],
                         'qlen': r['qlen'],
                         'qstart': r['qstart'],
                         'qend': r['qend'],
-                        'gene_id': r_acc.get('GeneID',r['sseqid']),
+                        'gene_id': gene_id,
                         'slen': r['slen'],
                         'sstart': r['sstart'],
                         'send': r['send'],
-                        'gene_desc': '',
-                        'rna_acc': r_acc.get('RNA_nucleotide_accession.version',r['sseqid']),
-                        'protein_acc': r_acc.get('protein_accession.version',''),
+                        'gene_desc': gene_desc,
+                        'rna_acc': r_acc.get('accession',r['sseqid']),
+                        'protein_acc': None,
                         'gene_symbol': r_acc.get('Symbol',''),
                         'staxids': staxids or '',
                         'score': 0 if len(score) == 0 else score[0]
                     })
+
+                    if (i % 1000) == 0 : logging.info(i)
+                    i += 1
 
 
 rule map_hits_to_taxclass:
@@ -382,9 +414,11 @@ rule map_hits_to_taxclass:
         #   nohits_to_fa
 
         from Bio import SeqIO
+        from collections import defaultdict
         import csv
         import gzip
         import logging
+        from pprint import pprint, pformat
         logging.basicConfig(level=logging.INFO)
 
         logging.info('loading transcripts')
@@ -432,6 +466,13 @@ rule map_hits_to_taxclass:
         )
         logging.info(pformat(nr_map['stats']))
 
+        for k, hits in nr_map['hits'].items() :
+            qseqids = [_['qseqid'] for _ in hits]
+            assert len(qseqids) == len(set(qseqids))
+
+        assert nr_map['nohits'].isdisjoint(nr_map['annot'])
+        assert nr_map['nohits'].union(nr_map['annot']) == set(transcripts)
+
         logging.info('loading minimap hits for blast nohits')
         # only pull hits from blast nohits
         minimap_hits = []
@@ -452,14 +493,20 @@ rule map_hits_to_taxclass:
         )
         logging.info(pformat(nohit_nt_map['stats']))
 
+        assert nohit_nt_map['nohits'].isdisjoint(nohit_nt_map['annot'])
+        assert nohit_nt_map['nohits'].union(nohit_nt_map['annot']) == nr_map['nohits']
+        assert (nohit_nt_map['nohits']
+                   .union(nohit_nt_map['annot'])
+                   .union(nr_map['annot'])
+               ) == set(transcripts)
+
         logging.info('sanity checks')
+
         # sanity check make sure we didn't reannotate anything
-        common_annot = set(nr_map['annot']).intersection(nohit_nt_map['annot'])
-        assert len(common_annot) == 0
+        assert set(nr_map['annot']).isdisjoint(nohit_nt_map['annot'])
 
         # make sure nt nohits aren't annotated in nr_map
-        nohit_nr_nt = set(nr_map['annot']).intersection(nohit_nt_map['nohits'])
-        assert len(nohit_nr_nt) == 0
+        assert set(nr_map['annot']).isdisjoint(nohit_nt_map['nohits'])
 
         logging.info('writing nohit fasta, {} nohit sequences'.format(
             len(nohit_nt_map['nohits']))
@@ -467,12 +514,14 @@ rule map_hits_to_taxclass:
         with gzip.open(output.nohitfa,'wt') as f :
             SeqIO.write([transcripts[_] for _ in nohit_nt_map['nohits']],f,'fasta')
 
-        logging.info('clustering nohits')
         # cluster the remaining nohits
+        logging.info('clustering nohits')
         nohit_cluster_hits = at.clustered_transcript_hits(
             nohit_nt_map['nohits'],
             cluster_map
         )
+
+        assert set(nohit_cluster_hits).isdisjoint(set(nr_map['annot']).union(nohit_nt_map['annot']))
 
         logging.info('merging all hits')
         all_hits = at.merge_hits(
@@ -516,7 +565,11 @@ rule sort_fasta:
                     tid = tid_patt.search(r[-1]).group(1)
                     taxclass = taxclass_patt.search(r[-1])
                     taxclass = taxclass.group(1) if taxclass is not None else 'nohit'
-                    taxa = taxon_patt.search(r[-1]).group(1)
+                    taxa = taxon_patt.search(r[-1])
+                    if taxa is not None :
+                        taxa = taxa.group(1)
+                    else :
+                        taxa = ''
                     taxclass_map[tid] = {
                         'taxclass': taxclass,
                         'taxonIDs': taxa
@@ -527,13 +580,13 @@ rule sort_fasta:
             # open all the file pointers
             fps = {}
             for tc in taxclasses :
-                fps[tc] = gzip.open('taxclass_fa/taxclass_{}_transcripts.fa.gz'.format(tc),'wt')
+                fps[tc] = open('taxclass_fa/taxclass_{}_transcripts.fa'.format(tc),'wt')
 
             for rec in SeqIO.parse(f,'fasta') :
                 taxinfo = taxclass_map[rec.id]
                 fps[taxinfo['taxclass']].write(
                     '>{}_{} taxclass={} taxids={}\n{}\n'.format(
-                        rec.id,taxinfo['taxclass'],taxinfo['taxclass'],taxinfo['taxonIDs'],rec.sequence
+                        rec.id,taxinfo['taxclass'],taxinfo['taxclass'],taxinfo['taxonIDs'],rec.seq
                     )
                 )
 
@@ -550,8 +603,8 @@ rule salmon_index:
         'salmon index -p {threads} --index {output[0]} -t {input}'
 
 rule genemap:
-    input: 'Holobiont_transcripts_blast_{db}.gtf'
-    output: 'Holobiont_transcripts_blast_{db}_tidmap.csv'
+    input: 'Holobiont_transcripts_hits.gtf'
+    output: 'Holobiont_transcripts_hits_tidmap.csv'
     run:
         import csv
         import re
@@ -568,6 +621,64 @@ rule genemap:
                         tid = patt.search(r[-1]).group(1)
                         out_f.writerow([tid,geneid])
 
+rule gtf_genes_to_csv:
+    input: 'Holobiont_transcripts_hits.gtf'
+    output: 'Holobiont_transcripts_hits_gene_annotation.csv'
+    run:
+        import csv
+
+        #WP_096859208.1
+        #blast
+        #gene
+        #394
+        #496
+        #.
+        #.
+        #.
+        #qlen "309"
+        #qstart "1"
+        #qend "309"
+        #gene_id "WP_096859208.1"
+        #slen "103"
+        #gene_desc "WP_096859208.1 alpha-D-glucose phosphate-specific phosphoglucomutase [Escherichia coli]"
+        #rna_acc ""
+        #protein_acc "WP_096859208.1"
+        #gene_symbol ""
+        #staxids "562"
+        #score "48.356547323513816"
+        #taxclass "bacteria"
+
+        gene_recs = {}
+        fields = (
+            'seqid',
+            'gene_id',
+            'gene_desc',
+            'gene_symbol',
+            'rna_acc',
+            'protein_acc',
+            'staxids',
+            'score',
+            'taxclass',
+            'qstart',
+            'qend',
+            'slen',
+        )
+
+        with open(input[0],'rt') as f :
+            with open(output[0],'wt') as f_out :
+                f_out = csv.DictWriter(f_out,fieldnames=fields,extrasaction='ignore')
+                f_out.writeheader()
+                for r in csv.reader(f,delimiter='\t') :
+                    seqid, source, feature, start, end, score, strand, frame, attrs = r
+                    attrs = [_.split(' ',1) for _ in attrs.strip().split(';')]
+                    attrs = {_[0]:_[1][1:-1] for _ in attrs if len(_) == 2}
+
+                    if feature == 'gene' :
+                        gene_recs[seqid] = attrs
+                    else :
+                        gene_rec = gene_recs[attrs['gene_id']].copy()
+                        gene_rec['seqid'] = attrs['transcript_id']
+                        f_out.writerow(gene_rec)
 
 rule salmon_quant:
     input:
