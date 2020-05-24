@@ -5,6 +5,7 @@ import gzip
 import logging
 import pandas
 import sys
+from pprint import pprint
 
 hits_fields = [
         'qseqid','qlen','qstart','qend',
@@ -114,12 +115,14 @@ def annotate_transcripts(
     for tid in nohit_tids :
         tid_cluster = cluster_map[tid]
         parent_tid = tid_cluster['parent_tid']
+
         if parent_tid in annot :
 
             # the parent sequence of this tid's cluster has a hit, assign it to tid
             parent_hit = annot[parent_tid]
 
             tid_cluster.update(parent_hit)
+            tid_cluster['qseqid'] = tid
 
             annot[tid] = parent_hit
 
