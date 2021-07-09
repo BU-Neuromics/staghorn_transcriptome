@@ -8,3 +8,7 @@ snakejob*
 *.swp
 .snakemake
 .ipynb_checkpoints
+*.csv
+*.svg
+*.html
+*.png
