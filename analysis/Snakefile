@@ -1,3 +1,4 @@
+import pandas
 from pprint import pprint, pformat
 
 subworkflow hits:
@@ -9,7 +10,8 @@ subworkflow ref_index:
     snakefile: 'ref_index.snake'
     workdir: 'hits'
 
-samples = ('B2','B11','B12','B22','F12','F18','F22','F23')
+sample_info = pandas.read_csv('sample_info.csv')
+samples = sample_info.sample_name
 
 # the taxid 28384 is for "other sequences", a top level taxonomy for
 # synthetic, artificial, vector, transposon sequences
@@ -51,7 +53,8 @@ rule all:
         'Holobiont_transcripts_hits.gtf',
         'Holobiont_transcripts_hits_tidmap.csv',
         'Holobiont_transcripts_hits_gene_annotation.csv',
-        taxclass_fa
+        taxclass_fa,
+        filt_taxclass
 
 rule build_taxa_graph:
     input: 'hits/nodes.dmp',
@@ -407,12 +410,6 @@ rule map_hits_to_taxclass:
         gtf='Holobiont_transcripts_hits.gtf',
         nohitfa='Holobiont_transcripts_nohit.fa.gz'
     run:
-        import annotate_transcripts as at
-        #   annotate_transcripts
-        #   clustered_transcript_hits,
-        #   hits_to_gtf
-        #   nohits_to_fa
-
         from Bio import SeqIO
         from collections import defaultdict
         import csv
@@ -421,14 +418,17 @@ rule map_hits_to_taxclass:
         from pprint import pprint, pformat
         logging.basicConfig(level=logging.INFO)
 
+        # custom method for annotating hits, etc
+        import annotate_transcripts as at
+        #   annotate_transcripts
+        #   clustered_transcript_hits,
+        #   hits_to_gtf
+        #   nohits_to_fa
+
         logging.info('loading transcripts')
         transcripts = {}
         for rec in SeqIO.parse(input.fa,'fasta') :
             transcripts[rec.id] = rec
-
-        logging.info('loading blast hits')
-        with gzip.open(input.nr,'rt') as f :
-            blast_hits = [_ for _ in csv.DictReader(f,fieldnames=at.hits_fields)]
 
         logging.info('loading taxa tree')
         with open(input.taxa, 'rt') as f :
@@ -454,79 +454,80 @@ rule map_hits_to_taxclass:
         )
         class_priority = list(zip(range(len(class_priority)),class_priority))
 
-        logging.info('mapping blast results')
-        # map blast results
-        nr_map = at.annotate_transcripts(
-            transcripts.keys(),
-            blast_hits,
-            taxa,
-            class_priority,
-            cluster_map,
-            'blast'
-        )
-        logging.info(pformat(nr_map['stats']))
-
-        for k, hits in nr_map['hits'].items() :
-            qseqids = [_['qseqid'] for _ in hits]
-            assert len(qseqids) == len(set(qseqids))
-
-        assert nr_map['nohits'].isdisjoint(nr_map['annot'])
-        assert nr_map['nohits'].union(nr_map['annot']) == set(transcripts)
-
-        logging.info('loading minimap hits for blast nohits')
+        logging.info('loading minimap hits')
         # only pull hits from blast nohits
-        minimap_hits = []
         with gzip.open(input.nt,'rt') as f :
-            for hit in csv.DictReader(f,fieldnames=at.hits_fields) :
-                if hit['qseqid'] in nr_map['nohits'] :
-                    minimap_hits.append(hit)
+            minimap_hits = [_ for _ in csv.DictReader(f,fieldnames=at.hits_fields)]
 
         logging.info('mapping minimap hits')
         # map nohit results to nt
-        nohit_nt_map = at.annotate_transcripts(
-            nr_map['nohits'],
+        nt_map = at.annotate_transcripts(
+            transcripts.keys(),
             minimap_hits,
             taxa,
             class_priority,
             cluster_map,
             'minimap'
         )
-        logging.info(pformat(nohit_nt_map['stats']))
+        logging.info(pformat(nt_map['stats']))
 
-        assert nohit_nt_map['nohits'].isdisjoint(nohit_nt_map['annot'])
-        assert nohit_nt_map['nohits'].union(nohit_nt_map['annot']) == nr_map['nohits']
-        assert (nohit_nt_map['nohits']
-                   .union(nohit_nt_map['annot'])
-                   .union(nr_map['annot'])
+        logging.info('loading blast hits for minimap nohits')
+        blast_hits = []
+        with gzip.open(input.nr,'rt') as f :
+            for hit in csv.DictReader(f,fieldnames=at.hits_fields) :
+                if hit['qseqid'] in nt_map['nohits'] :
+                    blast_hits.append(hit)
+
+        logging.info('mapping blast results')
+        # map blast results
+        nohit_nr_map = at.annotate_transcripts(
+            nt_map['nohits'],
+            blast_hits,
+            taxa,
+            class_priority,
+            cluster_map,
+            'blast'
+        )
+        logging.info(pformat(nohit_nr_map['stats']))
+
+        for k, hits in nohit_nr_map['hits'].items() :
+            qseqids = [_['qseqid'] for _ in hits]
+            assert len(qseqids) == len(set(qseqids))
+
+        assert nohit_nr_map['nohits'].isdisjoint(nohit_nr_map['annot'])
+        assert nohit_nr_map['nohits'].union(nohit_nr_map['annot']) == nt_map['nohits']
+        assert (nohit_nr_map['nohits']
+                   .union(nohit_nr_map['annot'])
+                   .union(nt_map['annot'])
                ) == set(transcripts)
 
         logging.info('sanity checks')
 
         # sanity check make sure we didn't reannotate anything
-        assert set(nr_map['annot']).isdisjoint(nohit_nt_map['annot'])
+        assert set(nt_map['annot']).isdisjoint(nohit_nr_map['annot'])
 
-        # make sure nt nohits aren't annotated in nr_map
-        assert set(nr_map['annot']).isdisjoint(nohit_nt_map['nohits'])
+        # make sure nr nohits aren't annotated in nt_map
+        assert set(nt_map['annot']).isdisjoint(nohit_nr_map['nohits'])
 
         logging.info('writing nohit fasta, {} nohit sequences'.format(
-            len(nohit_nt_map['nohits']))
+            len(nohit_nr_map['nohits']))
         )
         with gzip.open(output.nohitfa,'wt') as f :
-            SeqIO.write([transcripts[_] for _ in nohit_nt_map['nohits']],f,'fasta')
+            SeqIO.write([transcripts[_] for _ in nohit_nr_map['nohits']],f,'fasta')
 
         # cluster the remaining nohits
         logging.info('clustering nohits')
         nohit_cluster_hits = at.clustered_transcript_hits(
-            nohit_nt_map['nohits'],
+            nohit_nr_map['nohits'],
             cluster_map
         )
 
-        assert set(nohit_cluster_hits).isdisjoint(set(nr_map['annot']).union(nohit_nt_map['annot']))
+        assert set(nohit_cluster_hits).isdisjoint(set(nt_map['annot']).union(nohit_nr_map['annot']))
 
         logging.info('merging all hits')
         all_hits = at.merge_hits(
-            nr_map['hits'],
-            nohit_nt_map['hits'],
+            nt_map['hits'],
+            nohit_nr_map['hits'],
             nohit_cluster_hits
         )
         logging.info('total hits: {}'.format(len(all_hits)))
@@ -684,7 +685,7 @@ rule salmon_quant:
     input:
         r1='{sample}_R1trim.fq',
         r2='{sample}_R2trim.fq',
-        tidmap='Holobiont_transcripts_blast_tidmap.csv',
+        tidmap='Holobiont_transcripts_hits_tidmap.csv',
         index='Holobiont_transcripts__salmon_index'
     output:
         '{sample}__salmon_quant/quant.genes.sf'
@@ -700,13 +701,13 @@ rule csvgather:
     output:
         'all_salmon_quant.csv'
     shell:
-        'csvgather -j 0 -f NumReads -d , -t "s:NumReads:{{dir}}:" -t "s:_.*::" {input} -o {output}'
+        'csvgather -j 0 -f NumReads -d , -t "s:NumReads:{{dir}}:" -t "s:__salmon_quant::" {input} -o {output}'
 
 
 rule sort_salmon:
     input:
         cnts='all_salmon_quant.csv',
-        gtf='Holobiont_transcripts_all_blast.gtf'
+        gtf='Holobiont_transcripts_hits.gtf'
     output:
         taxclass_counts
     shell:
